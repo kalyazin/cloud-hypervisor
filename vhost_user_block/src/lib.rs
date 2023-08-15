@@ -13,6 +13,7 @@ use libc::EFD_NONBLOCK;
 use log::*;
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use qcow::{self, ImageType, QcowFile};
+use vm_memory::GuestAddress;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -93,6 +94,7 @@ struct VhostUserBlkThread {
     kill_evt: EventFd,
     writeback: Arc<AtomicBool>,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    initialised: bool,
 }
 
 impl VhostUserBlkThread {
@@ -111,6 +113,7 @@ impl VhostUserBlkThread {
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
             writeback,
             mem,
+            initialised: false,
         })
     }
 
@@ -119,6 +122,22 @@ impl VhostUserBlkThread {
         vring: &mut RwLockWriteGuard<VringState<GuestMemoryAtomic<GuestMemoryMmap>>>,
     ) -> bool {
         let mut used_descs = false;
+
+        if !self.initialised {
+            let q = vring.get_queue_mut();
+            let mem = self.mem.memory();
+
+            // Initialise next used index from the queue.
+            // If we do not do that, the backend will be thinking that
+            // the used ring is always reset, which is not the case when
+            // the frontend is restored from a snapshot.
+            let used_idx_offset = 2;
+            let used_idx_addr = GuestAddress(q.used_ring().checked_add(used_idx_offset).unwrap());
+            let used_idx = mem.load(used_idx_addr, Ordering::SeqCst).map(u16::from_le).unwrap();
+            q.set_next_used(used_idx);
+
+            self.initialised = true;
+        }
 
         while let Some(mut desc_chain) = vring
             .get_queue_mut()
